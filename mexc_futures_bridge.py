@@ -90,9 +90,9 @@ def clean_symbol_text(value: str) -> str:
 # ------------------------------------------------------------------------------
 # Configuration
 # ------------------------------------------------------------------------------
-WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET", "")
-EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY", "")
-EXCHANGE_API_SECRET = os.getenv("EXCHANGE_API_SECRET", "")
+WEBHOOK_SECRET = os.getenv("TRADINGVIEW_WEBHOOK_SECRET") or os.getenv("WEBHOOK_SECRET", "")
+EXCHANGE_API_KEY = os.getenv("EXCHANGE_API_KEY") or os.getenv("MEXC_API_KEY", "")
+EXCHANGE_API_SECRET = os.getenv("EXCHANGE_API_SECRET") or os.getenv("MEXC_API_SECRET", "")
 
 TRADING_ENABLED = env_bool("TRADING_ENABLED", False)
 DRY_RUN = env_bool("DRY_RUN", True)
