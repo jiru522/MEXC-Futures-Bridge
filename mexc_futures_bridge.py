@@ -948,6 +948,9 @@ def execute_entry(payload: TradingViewPayload, action: str, signal_id: str) -> d
     balance = ex.fetch_balance({"type": "swap"})
     free_usdt = extract_usdt_free(balance)
     if free_usdt <= 0:
+    if DRY_RUN:
+        free_usdt = 1000.0  # Simulated balance for dry-run testing
+    else:
         raise ValueError("No free USDT margin available")
 
     risk_usd = requested_risk(payload, free_usdt)
