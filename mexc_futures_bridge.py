@@ -662,7 +662,7 @@ def prepare_account_settings(symbol: str, leverage: int, side: str) -> None:
 
     if ENFORCE_MARGIN_MODE and hasattr(ex, "set_margin_mode"):
         try:
-            ex.set_margin_mode(MARGIN_MODE, symbol)
+            ex.set_margin_mode(MARGIN_MODE, symbol, params={'leverage': leverage})
         except Exception as exc:
             message = str(exc).lower()
             # MEXC may report that the account is already in the requested mode.
