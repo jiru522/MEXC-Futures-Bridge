@@ -847,9 +847,12 @@ def cancel_order_safely(order_id: Optional[str], symbol: str) -> None:
 # Signal validation and execution
 # ------------------------------------------------------------------------------
 def validate_secret(payload: TradingViewPayload) -> bool:
-    if not WEBHOOK_SECRET or WEBHOOK_SECRET == "YOUR_WEBHOOK_SECRET":
+    expected = (WEBHOOK_SECRET or "").strip()
+    received = (payload.secret or "").strip()
+    print(f"[AUTH DEBUG] Received: {repr(received)} | Expected: {repr(expected)}", flush=True)
+    if not expected or expected == "YOUR_WEBHOOK_SECRET":
         return False
-    return hmac.compare_digest(payload.secret, WEBHOOK_SECRET)
+    return hmac.compare_digest(received, expected)
 
 
 def validate_signal_freshness(payload: TradingViewPayload) -> None:
