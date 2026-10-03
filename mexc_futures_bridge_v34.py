@@ -54,10 +54,11 @@ from typing import Any, Optional
 import ccxt
 import requests
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 
 APP_NAME = "JIRU MEXC Futures Autonomous Bridge"
-APP_VERSION = "34.1.0"
+APP_VERSION = "34.2.0"
 
 
 # ==============================================================================
@@ -730,6 +731,11 @@ class StateStore:
         rows = self._run("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,), "all") or []
         for r in rows:
             r.pop("trade_path", None)
+        return rows
+
+    def recent_signals(self, limit: int = 40) -> list[dict]:
+        rows = self._run("SELECT signal_id, received_at, action, symbol, status, outcome, stage, reject_reason, "
+                         "trade_id, price FROM signals ORDER BY received_at DESC LIMIT ?", (limit,), "all") or []
         return rows
 
     def last_trade_ts(self, symbol: str) -> Optional[float]:
@@ -2453,6 +2459,154 @@ scanner = ScannerAgent(gateway, market_data, store, bias, research_agent)
 
 
 # ==============================================================================
+# Dashboard (static page; all data comes from the admin endpoints with the secret header)
+# ==============================================================================
+DASHBOARD_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JIRU MEXC Bridge</title>
+<style>
+:root{--base:#1e1e2e;--mantle:#181825;--crust:#11111b;--s0:#313244;--s1:#45475a;--o1:#7f849c;--sub:#a6adc8;--text:#cdd6f4;
+--blue:#89b4fa;--green:#a6e3a1;--red:#f38ba8;--peach:#fab387;--yellow:#f9e2af;--teal:#94e2d5;--mauve:#cba6f7}
+*{box-sizing:border-box}body{margin:0;background:var(--crust);color:var(--text);font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:14px 16px;background:var(--mantle);border-bottom:1px solid var(--s0)}
+h1{font-size:16px;margin:0;font-weight:700;letter-spacing:.3px}h1 small{color:var(--o1);font-weight:500;margin-left:6px}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;letter-spacing:.4px}
+.p-green{background:#a6e3a122;color:var(--green)}.p-red{background:#f38ba822;color:var(--red)}.p-yellow{background:#f9e2af22;color:var(--yellow)}
+.p-gray{background:#7f849c22;color:var(--sub)}
+main{padding:14px 16px;max-width:1300px;margin:0 auto}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:14px}
+.card{background:var(--base);border:1px solid var(--s0);border-left:3px solid var(--blue);border-radius:8px;padding:9px 12px}
+.card .t{font-size:10px;color:var(--o1);font-weight:700;letter-spacing:.6px;text-transform:uppercase}
+.card .v{font-size:22px;font-weight:700;margin-top:2px}.card .s{font-size:11px;color:var(--sub);min-height:15px}
+.panel{background:var(--mantle);border:1px solid var(--s0);border-radius:8px;margin-bottom:14px;overflow:hidden}
+.panel h2{margin:0;padding:9px 12px;font-size:11px;letter-spacing:.7px;text-transform:uppercase;color:var(--o1);border-bottom:1px solid var(--s0);display:flex;justify-content:space-between}
+.scroll{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:12.5px;white-space:nowrap}
+th{text-align:left;color:var(--o1);font-weight:600;padding:7px 10px;background:var(--base);position:sticky;top:0}
+td{padding:6px 10px;border-top:1px solid #31324455}tr:nth-child(even) td{background:#1e1e2e66}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}.pos{color:var(--green)}.neg{color:var(--red)}.mut{color:var(--o1)}
+.two{display:grid;gap:14px;grid-template-columns:1fr 1fr}@media(max-width:800px){.two{grid-template-columns:1fr}}
+.empty{padding:16px;color:var(--o1);text-align:center}.kv{padding:10px 12px;display:grid;grid-template-columns:auto 1fr;gap:4px 14px;font-size:12.5px}.kv b{color:var(--sub);font-weight:600}
+#login{max-width:380px;margin:12vh auto;background:var(--base);border:1px solid var(--s0);border-radius:10px;padding:20px}
+#login input{width:100%;padding:9px;border-radius:6px;border:1px solid var(--s1);background:var(--crust);color:var(--text);margin:10px 0}
+button{background:var(--blue);color:var(--crust);border:0;border-radius:6px;padding:8px 14px;font-weight:700;cursor:pointer}
+button.g{background:var(--s0);color:var(--sub)}svg{display:block;width:100%;height:120px}
+</style></head><body>
+<div id="login" style="display:none"><b>JIRU MEXC Bridge</b><div class="mut" style="font-size:12px;margin-top:4px">Enter your webhook secret. It is kept only in this browser.</div>
+<input id="sec" type="password" placeholder="TRADINGVIEW_WEBHOOK_SECRET" autocomplete="off"><button id="go">Open dashboard</button><div id="err" class="neg" style="margin-top:8px;font-size:12px"></div></div>
+<div id="app" style="display:none">
+<header><h1>JIRU MEXC Bridge<small id="ver"></small></h1>
+<div><span id="mode" class="pill p-gray">-</span> <span id="ex" class="pill p-gray">-</span> <span id="brk" class="pill p-green" style="display:none">BREAKER</span>
+<span class="mut" style="font-size:12px;margin:0 8px" id="upd"></span><button class="g" id="out">Sign out</button></div></header>
+<main>
+<div class="grid" id="kpis"></div>
+<div class="panel"><h2><span>Open positions</span><span id="npos" class="mut"></span></h2><div class="scroll" id="pos"></div></div>
+<div class="two">
+<div class="panel"><h2>Equity curve (closed trades, PnL $)</h2><div id="eq" style="padding:8px 10px"></div></div>
+<div class="panel"><h2>Performance by mode</h2><div class="scroll" id="perf"></div></div></div>
+<div class="panel"><h2><span>Recent trades</span></h2><div class="scroll" id="trades"></div></div>
+<div class="two">
+<div class="panel"><h2>Scanner</h2><div id="scan"></div></div>
+<div class="panel"><h2>2nd Brain / risk bias</h2><div id="brain"></div></div></div>
+<div class="panel"><h2><span>Signal feed</span><span id="rej" class="mut"></span></h2><div class="scroll" id="sigs"></div></div>
+</main></div>
+<script>
+const $=id=>document.getElementById(id);let SEC="";try{SEC=localStorage.getItem("bridge_secret")||""}catch(e){}
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num=(v,d=2)=>v==null||isNaN(v)?"-":Number(v).toFixed(d);
+const px=v=>v==null||isNaN(v)?"-":(Math.abs(v)>=100?Number(v).toFixed(2):Number(v).toPrecision(6).replace(/\.?0+$/,""));
+const cls=v=>v>0?"pos":v<0?"neg":"";const usd=v=>v==null?"-":(v>0?"+":"")+num(v,2);
+const tm=t=>t?new Date(t*1000).toLocaleString([], {month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):"-";
+function age(t){if(!t)return"-";const s=Math.max(0,Date.now()/1000-t);return s<3600?Math.round(s/60)+"m":(s/3600).toFixed(1)+"h"}
+function pill(t,c){return `<span class="pill p-${c}">${esc(t)}</span>`}
+function card(t,v,s,c){return `<div class="card" style="border-left-color:var(--${c||"blue"})"><div class="t">${esc(t)}</div><div class="v" style="color:var(--${c||"text"})">${v}</div><div class="s">${s||""}</div></div>`}
+function table(cols,rows,empty){if(!rows.length)return `<div class="empty">${esc(empty)}</div>`;
+ return "<table><thead><tr>"+cols.map(c=>`<th class="${c[2]||""}">${esc(c[0])}</th>`).join("")+"</tr></thead><tbody>"+rows.map(r=>"<tr>"+cols.map(c=>`<td class="${c[2]||""}">${c[1](r)}</td>`).join("")+"</tr>").join("")+"</tbody></table>"}
+async function api(p){const r=await fetch(p,{headers:{"X-Webhook-Secret":SEC},cache:"no-store"});if(r.status===401)throw new Error("401");if(!r.ok)throw new Error(r.status);return r.json()}
+function showLogin(m){$("app").style.display="none";$("login").style.display="block";$("err").textContent=m||""}
+function curve(closed){const pts=[0];let c=0;closed.forEach(t=>{c+=t.realized_pnl_usd||0;pts.push(c)});
+ if(pts.length<2)return `<div class="empty">No closed trades yet</div>`;
+ const mn=Math.min(...pts,0),mx=Math.max(...pts,0),rg=(mx-mn)||1,W=600,H=120,st=W/(pts.length-1);
+ const y=v=>H-6-((v-mn)/rg)*(H-12);const d=pts.map((v,i)=>(i?"L":"M")+(i*st).toFixed(1)+" "+y(v).toFixed(1)).join(" ");
+ const col=c>=0?"#a6e3a1":"#f38ba8";
+ return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><line x1="0" x2="${W}" y1="${y(0)}" y2="${y(0)}" stroke="#45475a" stroke-dasharray="4 4"/><path d="${d}" fill="none" stroke="${col}" stroke-width="2" vector-effect="non-scaling-stroke"/></svg><div class="mut" style="font-size:11px">Cumulative: <b class="${cls(c)}">${usd(c)} USD</b> over ${pts.length-1} trades</div>`}
+async function refresh(){
+ try{
+  const [st,an,tr,sg]=await Promise.all([api("/status"),api("/analytics"),api("/trades?limit=100"),api("/signals?limit=40")]);
+  $("login").style.display="none";$("app").style.display="block";
+  $("ver").textContent="v"+st.version;
+  const live=st.mode==="LIVE";$("mode").textContent=st.mode;$("mode").className="pill p-"+(live?"red":"yellow");
+  $("ex").textContent=st.exchange_ready?"EXCHANGE OK":"EXCHANGE DOWN";$("ex").className="pill p-"+(st.exchange_ready?"green":"red");
+  const susp=st.bias&&st.bias.suspended;$("brk").style.display=susp?"inline-block":"none";if(susp){$("brk").className="pill p-red";$("brk").textContent="BREAKER ACTIVE"}
+  $("upd").textContent="updated "+new Date().toLocaleTimeString();
+  const all=tr.trades||[],closed=all.filter(t=>t.status==="CLOSED").sort((a,b)=>(a.closed_at||a.updated_at)-(b.closed_at||b.updated_at));
+  const tot=an.analytics||[];const a=tot.find(x=>x.mode===st.mode)||tot[0]||{};
+  const pos=st.positions||[];const upnl=pos.reduce((s,p)=>s+(p.unrealized_usd||0),0);
+  const sc=st.scanner||{},S=st.stats||{};
+  $("kpis").innerHTML=card("Open positions",pos.length,`unrealized <b class="${cls(upnl)}">${usd(upnl)}</b>`,"blue")+
+   card("Closed trades",a.trades||0,`${a.wins||0} wins`,"mauve")+
+   card("Win rate",a.win_rate_pct!=null?num(a.win_rate_pct,1)+"%":"-","",a.win_rate_pct>=50?"green":"peach")+
+   card("Total PnL (net)",usd(a.total_pnl_usd||0)+" $","",(a.total_pnl_usd||0)>=0?"green":"red")+
+   card("Profit factor",a.profit_factor!=null?num(a.profit_factor,2):"-","","teal")+
+   card("Avg R",a.avg_r!=null?num(a.avg_r,2):"-","",(a.avg_r||0)>=0?"green":"red")+
+   card("Scanner",sc.enabled?(sc.cycles+" cycles"):"off",`${sc.submitted||0} setups submitted`,"blue")+
+   card("Signals",S.executed||0,`${S.rejected||0} rejected, ${S.failed||0} errors`,"yellow");
+  $("npos").textContent=pos.length?pos.length+" open":"";
+  $("pos").innerHTML=table([["#",r=>r.id],["Symbol",r=>esc(r.symbol)],["Side",r=>pill(r.side.toUpperCase(),r.side==="long"?"green":"red")],
+   ["Entry",r=>px(r.entry),"n"],["Price",r=>px(r.price),"n"],["Stop",r=>px(r.stop),"n"],["TP1",r=>px(r.tp1)+(r.tp1_done?" ✓":""),"n"],["TP2",r=>px(r.tp2)+(r.tp2_done?" ✓":""),"n"],
+   ["uPnL $",r=>`<span class="${cls(r.unrealized_usd)}">${usd(r.unrealized_usd)}</span>`,"n"],["R",r=>`<span class="${cls(r.r)}">${num(r.r,2)}</span>`,"n"],
+   ["Remaining",r=>num(r.remaining_pct,0)+"%","n"],["Mode",r=>pill(r.mode||"-",r.mode==="LIVE"?"red":"yellow")],["Age",r=>age(r.opened)]],pos,"No open positions");
+  $("eq").innerHTML=curve(closed);
+  $("perf").innerHTML=table([["Mode",r=>pill(r.mode,r.mode==="LIVE"?"red":"yellow")],["Trades",r=>r.trades,"n"],["Win %",r=>num(r.win_rate_pct,1),"n"],["PF",r=>num(r.profit_factor,2),"n"],
+   ["PnL $",r=>`<span class="${cls(r.total_pnl_usd)}">${usd(r.total_pnl_usd)}</span>`,"n"],["Avg R",r=>num(r.avg_r,2),"n"],["MFE %",r=>num(r.avg_mfe_pct,2),"n"],["MAE %",r=>num(r.avg_mae_pct,2),"n"],["Drag %",r=>num(r.median_exec_drag_pct,3),"n"]],tot,"No closed trades yet");
+  const recent=all.slice(0,25);
+  $("trades").innerHTML=table([["#",r=>r.id],["Symbol",r=>esc(r.symbol)],["Side",r=>esc(r.side)],["Mode",r=>pill(r.mode||"-",r.mode==="LIVE"?"red":"yellow")],
+   ["Status",r=>pill(r.status,r.status==="CLOSED"?"gray":"blue")],["Entry",r=>px(r.entry_price),"n"],["Exit",r=>px(r.exit_price),"n"],
+   ["PnL $",r=>`<span class="${cls(r.realized_pnl_usd)}">${r.status==="CLOSED"?usd(r.realized_pnl_usd):"-"}</span>`,"n"],["R",r=>`<span class="${cls(r.r_multiple)}">${r.status==="CLOSED"?num(r.r_multiple,2):"-"}</span>`,"n"],
+   ["Reason",r=>esc(r.exit_reason||"")],["Opened",r=>tm(r.created_at)],["Closed",r=>tm(r.closed_at)]],recent,"No trades yet");
+  const cands=(sc.last_candidates||[]);
+  $("scan").innerHTML=`<div class="kv"><b>Status</b><span>${sc.enabled?pill("RUNNING","green"):pill("OFF","gray")} ${sc.symbols||0} symbols</span><b>Last scan</b><span>${sc.last_run?new Date(sc.last_run).toLocaleTimeString():"-"}</span><b>Cycles / setups</b><span>${sc.cycles||0} / ${sc.submitted||0}</span><b>Last error</b><span class="${sc.last_error?"neg":"mut"}">${esc(sc.last_error||"none")}</span><b>Last candidates</b><span>${cands.length?cands.map(c=>esc(c.symbol.split("/")[0])+" ("+num(c.score,0)+")").join(", "):"<span class='mut'>none yet - waiting for a setup</span>"}</span></div>`;
+  const b=st.bias||{},e=b.effective||{},bl=b.bounds||{},m=b.meta||{},br=st.brain_last_run||{};
+  $("brain").innerHTML=`<div class="kv"><b>Stop distance x</b><span>${num(e.stop_distance_mult,2)} <span class="mut">(${(bl.stop_distance_mult||[]).join(" - ")})</span></span><b>Max open positions</b><span>${num(e.max_open_positions,0)} <span class="mut">(${(bl.max_open_positions||[]).join(" - ")})</span></span><b>Min volume accel</b><span>${num(e.min_volume_accel,2)} <span class="mut">(${(bl.min_volume_accel||[]).join(" - ")})</span></span><b>Source</b><span>${esc(m.source||"default")}</span><b>Last brain run</b><span>${br.at?new Date(br.at).toLocaleTimeString():"-"} <span class="mut">${esc(br.skipped||br.note||"")}</span></span><b>Breaker</b><span>${susp?pill("SUSPENDED until "+new Date(m.suspended_until*1000).toLocaleTimeString(),"red"):pill("OK","green")}</span></div>`;
+  const rj=an.rejections_24h||{};$("rej").textContent=rj.total!=null?rj.total+" rejected in 24h":"";
+  $("sigs").innerHTML=table([["Time",r=>tm(r.received_at)],["Symbol",r=>esc(r.symbol)],["Action",r=>esc(r.action)],["Outcome",r=>pill(r.outcome||r.status,r.outcome==="ACCEPTED"?"green":r.outcome==="REJECTED"?"yellow":r.outcome==="ERROR"?"red":"gray")],
+   ["Stage",r=>esc(r.stage||"")],["Reason",r=>`<span class="mut">${esc(r.reject_reason||"")}</span>`],["Trade",r=>r.trade_id||""]],sg.signals||[],"No signals yet");
+ }catch(e){if(String(e.message)==="401"){try{localStorage.removeItem("bridge_secret")}catch(x){}SEC="";showLogin("Wrong secret, try again")}else{$("upd").textContent="error: "+e.message}}
+}
+$("go").onclick=()=>{SEC=$("sec").value.trim();if(!SEC)return;try{localStorage.setItem("bridge_secret",SEC)}catch(e){}refresh()};
+$("sec").addEventListener("keydown",e=>{if(e.key==="Enter")$("go").click()});
+$("out").onclick=()=>{try{localStorage.removeItem("bridge_secret")}catch(e){}SEC="";showLogin("")};
+if(SEC){refresh()}else{showLogin("")}
+setInterval(()=>{if(SEC)refresh()},10000);
+</script></body></html>
+"""
+
+
+def live_positions() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for t in store.active_trades():
+        try:
+            price = gateway.ticker(t["symbol"])["last"] if gateway.ready else None
+        except Exception:
+            price = None
+        dirn = 1 if t["side"] == "long" else -1
+        entry = safe_float(t.get("entry_price"), 0.0) or 0.0
+        qty = (safe_float(t.get("remaining"), None) if t.get("remaining") is not None else safe_float(t.get("amount"), 0.0)) or 0.0
+        csize = safe_float(t.get("contract_size"), 1.0) or 1.0
+        total = safe_float(t.get("amount"), 0.0) or 0.0
+        stop_dist = safe_float(t.get("stop_distance"), 0.0) or 0.0
+        unreal = (price - entry) * dirn * qty * csize if price else None
+        out.append({"id": t["id"], "symbol": t["symbol"], "side": t["side"], "entry": entry, "price": price,
+                    "stop": t.get("current_sl") or t.get("stop_price"), "tp1": t.get("tp1_price"),
+                    "tp2": t.get("tp2_price"), "tp1_done": t.get("tp1_done"), "tp2_done": t.get("tp2_done"),
+                    "unrealized_usd": unreal,
+                    "r": ((price - entry) * dirn / stop_dist) if (price and stop_dist > 0) else None,
+                    "remaining_pct": (qty / total * 100.0) if total > 0 else None,
+                    "mode": t.get("mode"), "opened": t.get("created_at")})
+    return out
+
+
+# ==============================================================================
 # FastAPI
 # ==============================================================================
 def validate_config() -> None:
@@ -2535,14 +2689,28 @@ async def ready() -> dict[str, Any]:
     return {"ready": True, "exchange_ready": True}
 
 
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> str:
+    """Static page; it asks for the secret in the browser and calls the admin endpoints itself."""
+    return DASHBOARD_HTML
+
+
+@app.get("/signals")
+async def signals_endpoint(limit: int = 40, x_webhook_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
+    require_admin(x_webhook_secret)
+    return {"signals": store.recent_signals(max(1, min(limit, 200)))}
+
+
 @app.get("/status")
 async def status(x_webhook_secret: Optional[str] = Header(default=None)) -> dict[str, Any]:
     require_admin(x_webhook_secret)
     with STATS_LOCK:
         snap = dict(STATS)
+    positions = await asyncio.to_thread(live_positions)
     return {"service": APP_NAME, "version": APP_VERSION, "mode": "LIVE" if is_live() else "PAPER",
             "exchange_ready": gateway.ready, "stats": snap, "active_trades": len(store.active_trades()),
-            "bias": bias.snapshot(), "brain_last_run": maintainer.last_run, "scanner": scanner.snapshot(), "timestamp": utc_iso()}
+            "bias": bias.snapshot(), "brain_last_run": maintainer.last_run, "scanner": scanner.snapshot(), "positions": positions,
+            "timestamp": utc_iso()}
 
 
 @app.get("/analytics")
