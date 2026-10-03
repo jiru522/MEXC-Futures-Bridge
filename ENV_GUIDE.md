@@ -139,12 +139,19 @@ The scanner looks for **long-only** setups by itself every minute on MEXC data a
 
 Check it at `GET /status` (header `X-Webhook-Secret`) under `"scanner"`. Because costs are checked up front, tight-stop setups on very low-volatility majors are skipped; that is expected. Keep `TRADING_ENABLED=false` / `DRY_RUN=true` until the paper ledger (`/analytics`) looks good.
 
+## Portal / browser access (v34.3)
+| Variable | Default | Meaning |
+|---|---|---|
+| `CORS_ALLOW_ORIGINS` | `*` | Which websites may call the data endpoints from a browser (comma-separated). Data endpoints still require the secret header, so `*` is safe; restrict it if you host the portal on a fixed URL. |
+
+`/portal` is a static page: project URLs and secrets you enter there are saved only in your own browser.
+
 ## Deploy
 * **Railway**: `railway.json` already holds the start command (`uvicorn mexc_futures_bridge_v34:app ...`) and `/health` check. Add a Volume mounted at `/data`.
 * **Render**: Start command `uvicorn mexc_futures_bridge_v34:app --host 0.0.0.0 --port $PORT`, health check path `/health`, attach a Disk at `/data` (disks need a paid instance; on the free tier the ledger resets on every redeploy and free instances sleep when idle, which stops the position monitor - for live trading use an always-on instance).
 
 ## Endpoints
-**`GET /dashboard`** (visual dashboard: open it in any browser, enter the secret once; auto-refreshes every 10 s), `POST /webhook` (TradingView), `GET /health`, `GET /ready`. With header `X-Webhook-Secret`: `GET /status`, `/analytics`, `/trades?limit=20`, `/signals?limit=40`, `/bias`, and `POST /brain/run` (run one 2nd Brain cycle now).
+**`GET /portal`** (multi-project control portal), **`GET /dashboard`** (visual dashboard: open it in any browser, enter the secret once; auto-refreshes every 10 s), `POST /webhook` (TradingView), `GET /health`, `GET /ready`. With header `X-Webhook-Secret`: `GET /status`, `/analytics`, `/trades?limit=20`, `/signals?limit=40`, `/bias`, and `POST /brain/run` (run one 2nd Brain cycle now).
 
 ## TradingView alert body
 Same as before (see `clean_test.json`): `secret, signal_id, action (BUY_LONG|SELL_SHORT|EXIT_LONG|EXIT_SHORT), symbol, price, sl, tp1, tp2, leverage, risk_usd, timestamp`. `sl/tp1/tp2` are optional; when omitted they are derived from ATR.

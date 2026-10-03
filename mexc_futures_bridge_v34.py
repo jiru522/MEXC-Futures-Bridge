@@ -54,11 +54,12 @@ from typing import Any, Optional
 import ccxt
 import requests
 from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 
 APP_NAME = "JIRU MEXC Futures Autonomous Bridge"
-APP_VERSION = "34.2.0"
+APP_VERSION = "34.3.0"
 
 
 # ==============================================================================
@@ -260,6 +261,9 @@ BRAIN_LOOKBACK_TRADES = env_int("BRAIN_LOOKBACK_TRADES", 30)
 BREAKER_LOSSES = env_int("BREAKER_LOSSES", 4)
 BREAKER_SUSPEND_HOURS = env_float("BREAKER_SUSPEND_HOURS", 6.0)
 BREAKER_HALTS_ENTRIES = env_bool("BREAKER_HALTS_ENTRIES", False)  # also block new entries while suspended
+
+# --- portal / browser access ------------------------------------------------------
+CORS_ALLOW_ORIGINS = [o.strip() for o in env_str("CORS_ALLOW_ORIGINS", "*").split(",") if o.strip()]  # data endpoints still need the secret header
 
 # --- autonomous scanner (no TradingView needed) ------------------------------------
 SCANNER_ENABLED = env_bool("SCANNER_ENABLED", True)        # self-generated LONG setups; still obeys paper/live gates
@@ -2581,6 +2585,148 @@ setInterval(()=>{if(SEC)refresh()},10000);
 </script></body></html>
 """
 
+PORTAL_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JIRU Control Portal</title>
+<style>
+:root{--base:#1e1e2e;--mantle:#181825;--crust:#11111b;--s0:#313244;--s1:#45475a;--o1:#7f849c;--sub:#a6adc8;--text:#cdd6f4;
+--blue:#89b4fa;--green:#a6e3a1;--red:#f38ba8;--peach:#fab387;--yellow:#f9e2af;--teal:#94e2d5;--mauve:#cba6f7}
+*{box-sizing:border-box}html,body{height:100%}body{margin:0;background:var(--crust);color:var(--text);font:14px/1.4 system-ui,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:10px 16px;background:var(--mantle);border-bottom:1px solid var(--s0)}
+h1{font-size:16px;margin:0}h1 small{color:var(--o1);font-weight:500;margin-left:6px}
+nav{display:flex;gap:4px;padding:8px 16px 0;background:var(--mantle);border-bottom:1px solid var(--s0);overflow-x:auto}
+nav button{background:none;color:var(--sub);border:0;border-bottom:2px solid transparent;border-radius:0;padding:8px 12px;font-weight:600;white-space:nowrap}
+nav button.on{color:var(--text);border-bottom-color:var(--blue)}
+button{background:var(--blue);color:var(--crust);border:0;border-radius:6px;padding:7px 12px;font-weight:700;cursor:pointer;font-size:13px}
+button.g{background:var(--s0);color:var(--sub)}button.r{background:#f38ba833;color:var(--red)}
+main{flex:1;overflow:auto;padding:14px 16px;min-height:0}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:700;letter-spacing:.4px}
+.p-green{background:#a6e3a122;color:var(--green)}.p-red{background:#f38ba822;color:var(--red)}.p-yellow{background:#f9e2af22;color:var(--yellow)}.p-gray{background:#7f849c22;color:var(--sub)}.p-blue{background:#89b4fa22;color:var(--blue)}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.card{background:var(--base);border:1px solid var(--s0);border-top:3px solid var(--blue);border-radius:10px;padding:14px}
+.card h3{margin:0 0 2px;font-size:15px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+.url{color:var(--o1);font-size:11.5px;word-break:break-all;margin-bottom:10px}
+.kpis{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}
+.kpi{background:var(--mantle);border-radius:7px;padding:7px 9px}.kpi .t{font-size:10px;color:var(--o1);font-weight:700;text-transform:uppercase;letter-spacing:.5px}.kpi .v{font-size:17px;font-weight:700}
+.row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.pos{color:var(--green)}.neg{color:var(--red)}.mut{color:var(--o1)}
+.alerts{margin-bottom:14px;display:flex;flex-direction:column;gap:6px}.alert{padding:8px 12px;border-radius:8px;font-size:13px;border:1px solid var(--s0);background:var(--base)}
+.alert.warn{border-color:#f9e2af55;color:var(--yellow)}.alert.bad{border-color:#f38ba855;color:var(--red)}.alert.ok{border-color:#a6e3a133;color:var(--green)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 12px;font-size:12.5px;margin-top:8px}.kv b{color:var(--sub);font-weight:600}
+iframe{width:100%;height:100%;border:1px solid var(--s0);border-radius:8px;background:var(--crust)}
+.frame{display:flex;flex-direction:column;height:100%;gap:8px}.bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.links{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+.link{display:block;background:var(--base);border:1px solid var(--s0);border-radius:8px;padding:12px;color:var(--text);text-decoration:none}.link:hover{border-color:var(--blue)}.link small{display:block;color:var(--o1);margin-top:2px}
+dialog{background:var(--base);color:var(--text);border:1px solid var(--s1);border-radius:10px;padding:18px;width:min(440px,92vw)}dialog::backdrop{background:#000a}
+label{display:block;font-size:12px;color:var(--sub);margin-top:10px}input,select{width:100%;padding:8px;border-radius:6px;border:1px solid var(--s1);background:var(--crust);color:var(--text);margin-top:3px}
+.empty{padding:30px;text-align:center;color:var(--o1)}
+</style></head><body>
+<header><h1>JIRU Control Portal<small>automation trading hub</small></h1>
+<div class="bar"><span class="mut" id="clock"></span><span class="mut" id="upd"></span><button class="g" id="refresh">Refresh</button><button id="add">+ Add project</button></div></header>
+<nav id="tabs"></nav>
+<main id="main"></main>
+<dialog id="dlg"><form method="dialog" id="form"><b id="dtitle">Project</b>
+<label>Name<input id="f_name" required></label>
+<label>Type<select id="f_type"><option value="bridge">MEXC Futures Bridge (v34+)</option><option value="generic">Generic web app / API</option></select></label>
+<label>Base URL<input id="f_url" placeholder="https://your-app.up.railway.app"></label>
+<label>Secret (X-Webhook-Secret) <span class="mut">optional for generic</span><input id="f_secret" type="password" autocomplete="off"></label>
+<label>Status path (generic) <span class="mut">JSON/health endpoint</span><input id="f_path" placeholder="/health"></label>
+<div class="row" style="justify-content:space-between"><button type="button" class="r" id="f_del">Remove</button><span><button type="button" class="g" id="f_cancel">Cancel</button> <button id="f_save" value="ok">Save</button></span></div>
+</form></dialog>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const num=(v,d=2)=>v==null||isNaN(v)?"-":Number(v).toFixed(d);const cls=v=>v>0?"pos":v<0?"neg":"";const usd=v=>v==null?"-":(v>0?"+":"")+num(v,2);
+const load=(k,d)=>{try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}};
+const save=(k,v)=>{try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+const SELF=location.protocol.startsWith("http")?location.origin:"";
+const DEFAULT_PROJECTS=[
+ {id:"bridge",name:"MEXC Futures Bridge",type:"bridge",url:(SELF&&/\/portal|railway|localhost|127\./.test(location.href))?SELF:"https://mexc-futures-bridge-production.up.railway.app",secret:"",path:"/health"},
+ {id:"jiruweb",name:"JIRU Web",type:"generic",url:"",secret:"",path:"/health"}];
+const DEFAULT_LINKS=[["Railway dashboard","https://railway.com/dashboard","Deployments, variables, logs"],["MEXC Futures","https://futures.mexc.com/exchange","Exchange"],["TradingView","https://www.tradingview.com/chart/","Charts / SOP Sentinel"],["OpenRouter","https://openrouter.ai/activity","2nd Brain LLM usage"],["GeckoTerminal","https://www.geckoterminal.com/","DEX data"],["GitHub","https://github.com/","Repos"]];
+let projects=load("portal_projects",DEFAULT_PROJECTS),links=load("portal_links",DEFAULT_LINKS),tab="overview",data={},editing=null;
+function norm(u){return(u||"").trim().replace(/\/+$/,"")}
+async function get(p,path,secret){const t0=performance.now();const h={};if(secret)h["X-Webhook-Secret"]=secret;
+ const ctl=new AbortController();const to=setTimeout(()=>ctl.abort(),9000);
+ try{const r=await fetch(norm(p.url)+path,{headers:h,cache:"no-store",signal:ctl.signal});const ms=Math.round(performance.now()-t0);
+  let body=null;try{body=await r.json()}catch(e){}return{ok:r.ok,status:r.status,ms,body}}finally{clearTimeout(to)}}
+async function poll(p){
+ if(!p.url){data[p.id]={state:"unconfigured"};return}
+ try{
+  if(p.type==="bridge"){
+   const h=await get(p,"/health");
+   if(!h.ok){data[p.id]={state:"down",ms:h.ms,err:"HTTP "+h.status};return}
+   if(!p.secret){data[p.id]={state:"nosecret",ms:h.ms,health:h.body};return}
+   const [st,tr]=await Promise.all([get(p,"/status",p.secret),get(p,"/analytics",p.secret)]);
+   if(st.status===401){data[p.id]={state:"badsecret",ms:h.ms};return}
+   data[p.id]={state:"up",ms:h.ms,health:h.body,status:st.body,analytics:tr.body}
+  }else{
+   const g=await get(p,p.path||"/health",p.secret);
+   data[p.id]={state:g.ok?"up":"down",ms:g.ms,body:g.body,err:g.ok?null:"HTTP "+g.status}
+  }
+ }catch(e){data[p.id]={state:"down",err:(e&&e.name==="AbortError")?"timeout":"unreachable (offline, or CORS blocked)"}}
+}
+async function pollAll(){await Promise.all(projects.map(poll));$("upd").textContent="updated "+new Date().toLocaleTimeString();render()}
+function pill(t,c){return `<span class="pill p-${c}">${esc(t)}</span>`}
+function stateBadge(d){return({up:pill("ONLINE","green"),down:pill("OFFLINE","red"),unconfigured:pill("NOT CONFIGURED","gray"),nosecret:pill("ADD SECRET","yellow"),badsecret:pill("WRONG SECRET","red")})[d.state]||pill("?","gray")}
+function kpi(t,v,c){return `<div class="kpi"><div class="t">${esc(t)}</div><div class="v ${c||""}">${v}</div></div>`}
+function bridgeCard(p,d){
+ if(d.state!=="up"){const h=d.health||{};return `<div class="kv"><b>Detail</b><span>${esc(d.err||(d.state==="nosecret"?"Reachable. Add the secret to see trades and PnL.":d.state==="badsecret"?"The secret was rejected (401).":"-"))}</span>${h.mode?`<b>Mode</b><span>${esc(h.mode)}</span>`:""}</div>`}
+ const s=d.status||{},a=(d.analytics&&d.analytics.analytics)||[],m=a.find(x=>x.mode===s.mode)||a[0]||{},pos=s.positions||[],u=pos.reduce((x,y)=>x+(y.unrealized_usd||0),0),sc=s.scanner||{};
+ return `<div class="kpis">${kpi("Open",pos.length)}${kpi("Unrealized",usd(u),cls(u))}${kpi("Closed",m.trades||0)}${kpi("Win rate",m.win_rate_pct!=null?num(m.win_rate_pct,0)+"%":"-")}${kpi("PnL net",usd(m.total_pnl_usd||0),cls(m.total_pnl_usd))}${kpi("Avg R",m.avg_r!=null?num(m.avg_r,2):"-",cls(m.avg_r))}</div>
+ <div class="kv"><b>Scanner</b><span>${sc.enabled?esc(sc.cycles+" cycles, "+sc.submitted+" setups"):"off"} ${sc.last_error?pill("ERROR","red"):""}</span><b>Version</b><span>v${esc(s.version)}</span></div>`}
+function genericCard(p,d){
+ if(d.state!=="up")return `<div class="kv"><b>Detail</b><span>${esc(d.err||(d.state==="unconfigured"?"Add the URL with the Edit button.":"-"))}</span></div>`;
+ const b=d.body&&typeof d.body==="object"?d.body:null;
+ const rows=b?Object.entries(b).filter(([k,v])=>v===null||["string","number","boolean"].includes(typeof v)).slice(0,10):[];
+ return rows.length?`<div class="kv">${rows.map(([k,v])=>`<b>${esc(k)}</b><span>${esc(v)}</span>`).join("")}</div>`:`<div class="kv"><b>Detail</b><span class="mut">Reachable (no JSON summary).</span></div>`}
+function projectCard(p){
+ const d=data[p.id]||{state:"unconfigured"};const mode=d.status&&d.status.mode;
+ const colour=d.state==="up"?"var(--green)":d.state==="down"||d.state==="badsecret"?"var(--red)":"var(--s1)";
+ return `<div class="card" style="border-top-color:${colour}"><h3><span>${esc(p.name)}</span><span>${mode?pill(mode,mode==="LIVE"?"red":"yellow")+" ":""}${stateBadge(d)}</span></h3>
+ <div class="url">${esc(p.url||"no URL set")}${d.ms?" · "+d.ms+" ms":""}</div>
+ ${p.type==="bridge"?bridgeCard(p,d):genericCard(p,d)}
+ <div class="row"><button data-open="${esc(p.id)}">Open</button><button class="g" data-edit="${esc(p.id)}">Edit</button>${p.url?`<a href="${esc(norm(p.url)+(p.type==="bridge"?"/dashboard":""))}" target="_blank" rel="noopener"><button class="g" type="button">New tab ↗</button></a>`:""}</div></div>`}
+function alerts(){const out=[];
+ projects.forEach(p=>{const d=data[p.id]||{};
+  if(d.state==="down")out.push(["bad",`${p.name} is offline (${d.err||"no response"})`]);
+  if(d.state==="badsecret")out.push(["bad",`${p.name}: secret rejected`]);
+  if(d.state==="nosecret")out.push(["warn",`${p.name}: add the secret to see live stats`]);
+  const s=d.status;if(s){if(s.mode==="LIVE")out.push(["warn",`${p.name} is in LIVE mode, real orders are enabled`]);
+   if(!s.exchange_ready)out.push(["bad",`${p.name}: exchange not ready`]);
+   if(s.bias&&s.bias.suspended)out.push(["bad",`${p.name}: circuit breaker active (2nd Brain overrides suspended)`]);
+   if(s.scanner&&s.scanner.last_error)out.push(["warn",`${p.name} scanner error: ${s.scanner.last_error}`]);
+   if(s.stats&&s.stats.last_error)out.push(["warn",`${p.name} last error: ${s.stats.last_error}`])}});
+ if(!out.length)out.push(["ok","All configured projects look healthy"]);
+ return `<div class="alerts">${out.map(a=>`<div class="alert ${a[0]}">${esc(a[1])}</div>`).join("")}</div>`}
+function renderTabs(){$("tabs").innerHTML=[["overview","Overview"],...projects.map(p=>[p.id,p.name]),["links","Quick links"]].map(([id,l])=>`<button class="${tab===id?"on":""}" data-tab="${esc(id)}">${esc(l)}</button>`).join("")}
+function render(){renderTabs();const m=$("main");
+ if(tab==="overview"){m.innerHTML=alerts()+`<div class="grid">${projects.map(projectCard).join("")}</div>`}
+ else if(tab==="links"){m.innerHTML=`<div class="links">${links.map((l,i)=>`<a class="link" href="${esc(l[1])}" target="_blank" rel="noopener">${esc(l[0])}<small>${esc(l[2]||l[1])}</small></a>`).join("")}</div><div class="row"><button class="g" id="addlink">+ Add link</button><button class="g" id="rstlinks">Reset links</button></div>`}
+ else{const p=projects.find(x=>x.id===tab);if(!p){tab="overview";return render()}
+  if(!p.url){m.innerHTML=`<div class="empty">No URL set for ${esc(p.name)} yet.<br><br><button data-edit="${esc(p.id)}">Configure</button></div>`;return}
+  const src=norm(p.url)+(p.type==="bridge"?"/dashboard":"");
+  m.innerHTML=`<div class="frame"><div class="bar">${stateBadge(data[p.id]||{state:"unconfigured"})}<a href="${esc(src)}" target="_blank" rel="noopener"><button class="g" type="button">Open in new tab ↗</button></a><button class="g" data-edit="${esc(p.id)}">Edit</button><span class="mut" style="font-size:12px">If the frame stays blank, the app blocks embedding: use New tab.</span></div><iframe src="${esc(src)}" referrerpolicy="no-referrer"></iframe></div>`}
+}
+document.addEventListener("click",e=>{const t=e.target.closest("[data-tab],[data-open],[data-edit]");
+ if(t){if(t.dataset.tab){tab=t.dataset.tab;render()}else if(t.dataset.open){tab=t.dataset.open;render()}else if(t.dataset.edit){edit(t.dataset.edit)}return}
+ if(e.target.id==="addlink"){const n=prompt("Link name");const u=n&&prompt("URL (https://...)");if(n&&u&&/^https?:\/\//i.test(u)){links.push([n,u,""]);save("portal_links",links);render()}}
+ if(e.target.id==="rstlinks"){links=DEFAULT_LINKS;save("portal_links",links);render()}});
+function edit(id){editing=id;const p=id==="new"?{name:"",type:"generic",url:"",secret:"",path:"/health"}:projects.find(x=>x.id===id);
+ $("dtitle").textContent=id==="new"?"Add project":"Edit "+p.name;$("f_name").value=p.name;$("f_type").value=p.type;$("f_url").value=p.url;$("f_secret").value=p.secret||"";$("f_path").value=p.path||"/health";$("f_del").style.display=id==="new"?"none":"inline-block";$("dlg").showModal()}
+$("add").onclick=()=>edit("new");$("f_cancel").onclick=()=>$("dlg").close();
+$("f_del").onclick=()=>{if(confirm("Remove this project from the portal? (the app itself is not touched)")){projects=projects.filter(x=>x.id!==editing);save("portal_projects",projects);tab="overview";$("dlg").close();pollAll()}};
+$("form").addEventListener("submit",ev=>{ev.preventDefault();const u=norm($("f_url").value);if(u&&!/^https?:\/\//i.test(u)){alert("URL must start with http:// or https://");return}
+ const o={name:$("f_name").value.trim(),type:$("f_type").value,url:u,secret:$("f_secret").value.trim(),path:$("f_path").value.trim()||"/health"};
+ if(editing==="new"){o.id="p"+Date.now().toString(36);projects.push(o);tab=o.id}else{const i=projects.findIndex(x=>x.id===editing);o.id=editing;projects[i]=o}
+ save("portal_projects",projects);$("dlg").close();pollAll()});
+$("refresh").onclick=pollAll;
+setInterval(()=>{$("clock").textContent=new Date().toLocaleString([], {weekday:"short",month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"})},1000);
+setInterval(()=>{if(!document.hidden&&tab==="overview")pollAll()},15000);
+render();pollAll();
+</script></body></html>
+"""
+
 
 def live_positions() -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
@@ -2661,6 +2807,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=CORS_ALLOW_ORIGINS, allow_methods=["GET", "POST", "OPTIONS"],
+                   allow_headers=["*"], max_age=600)
 
 
 def require_admin(secret: Optional[str]) -> None:
@@ -2693,6 +2841,12 @@ async def ready() -> dict[str, Any]:
 async def dashboard() -> str:
     """Static page; it asks for the secret in the browser and calls the admin endpoints itself."""
     return DASHBOARD_HTML
+
+
+@app.get("/portal", response_class=HTMLResponse)
+async def portal() -> str:
+    """Multi-project control portal (static page; settings live in the browser)."""
+    return PORTAL_HTML
 
 
 @app.get("/signals")
