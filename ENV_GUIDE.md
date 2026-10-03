@@ -122,6 +122,23 @@ OPENROUTER_API_KEY=<optional>
 ```
 MEXC must be in **one-way** position mode before the first live signal.
 
+## Autonomous scanner (v34.1 - no TradingView needed)
+The scanner looks for **long-only** setups by itself every minute on MEXC data and sends them through the same Research -> Analysis -> Trader gates as a webhook signal, so paper/live mode, the $10 risk cap, R:R >= 1.5, cost gate, position limits, cooldown and the circuit breaker all still apply. Setup: 1h uptrend (EMA8 > EMA21, close above EMA21), 5m EMA20 > EMA50, a recent pullback to the 5m EMA20, then a bullish candle that closes above EMA20 and the previous high; volume acceleration must pass; stop = below the last 8 bars' low (max 3 ATR). It trades at most one setup per cycle.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SCANNER_ENABLED` | `true` | Turn the scanner on/off. |
+| `SCANNER_SYMBOLS` | BTC,ETH,SOL,XRP,DOGE,BNB,ADA,AVAX,LINK,SUI,LTC,DOT,NEAR,APT,ARB | Base coins to watch (USDT-M). |
+| `SCANNER_INTERVAL_SEC` | `60` | Scan frequency. |
+| `SCANNER_MAX_PER_CYCLE` | `1` | Max new entries per scan. |
+| `SCANNER_MIN_SCORE` | `65` | Minimum setup score (0-100). |
+| `SCANNER_SWING_BARS` | `8` | Stop goes below the lowest low of N 5m bars. |
+| `SCANNER_MAX_STOP_ATR` | `3.0` | Skip setups whose stop is wider than N ATR. |
+| `SCANNER_PULLBACK_ATR` | `0.35` | How close to EMA20 the pullback must come. |
+| `SCANNER_MAX_EXTENSION_ATR` | `1.5` | Do not chase when close is more than N ATR above EMA20. |
+
+Check it at `GET /status` (header `X-Webhook-Secret`) under `"scanner"`. Because costs are checked up front, tight-stop setups on very low-volatility majors are skipped; that is expected. Keep `TRADING_ENABLED=false` / `DRY_RUN=true` until the paper ledger (`/analytics`) looks good.
+
 ## Deploy
 * **Railway**: `railway.json` already holds the start command (`uvicorn mexc_futures_bridge_v34:app ...`) and `/health` check. Add a Volume mounted at `/data`.
 * **Render**: Start command `uvicorn mexc_futures_bridge_v34:app --host 0.0.0.0 --port $PORT`, health check path `/health`, attach a Disk at `/data` (disks need a paid instance; on the free tier the ledger resets on every redeploy and free instances sleep when idle, which stops the position monitor - for live trading use an always-on instance).

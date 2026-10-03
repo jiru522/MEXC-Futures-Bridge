@@ -57,7 +57,7 @@ from fastapi import FastAPI, HTTPException, Request, BackgroundTasks, Header
 from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 
 APP_NAME = "JIRU MEXC Futures Autonomous Bridge"
-APP_VERSION = "34.0.0"
+APP_VERSION = "34.1.0"
 
 
 # ==============================================================================
@@ -259,6 +259,18 @@ BRAIN_LOOKBACK_TRADES = env_int("BRAIN_LOOKBACK_TRADES", 30)
 BREAKER_LOSSES = env_int("BREAKER_LOSSES", 4)
 BREAKER_SUSPEND_HOURS = env_float("BREAKER_SUSPEND_HOURS", 6.0)
 BREAKER_HALTS_ENTRIES = env_bool("BREAKER_HALTS_ENTRIES", False)  # also block new entries while suspended
+
+# --- autonomous scanner (no TradingView needed) ------------------------------------
+SCANNER_ENABLED = env_bool("SCANNER_ENABLED", True)        # self-generated LONG setups; still obeys paper/live gates
+SCANNER_SYMBOLS = [s.strip().upper() for s in env_str(
+    "SCANNER_SYMBOLS", "BTC,ETH,SOL,XRP,DOGE,BNB,ADA,AVAX,LINK,SUI,LTC,DOT,NEAR,APT,ARB").split(",") if s.strip()]
+SCANNER_INTERVAL_SEC = env_float("SCANNER_INTERVAL_SEC", 60.0)
+SCANNER_MAX_PER_CYCLE = env_int("SCANNER_MAX_PER_CYCLE", 1)
+SCANNER_MIN_SCORE = env_float("SCANNER_MIN_SCORE", 65.0)
+SCANNER_SWING_BARS = env_int("SCANNER_SWING_BARS", 8)       # stop sits below the lowest low of N 5m bars
+SCANNER_MAX_STOP_ATR = env_float("SCANNER_MAX_STOP_ATR", 3.0)
+SCANNER_PULLBACK_ATR = env_float("SCANNER_PULLBACK_ATR", 0.35)
+SCANNER_MAX_EXTENSION_ATR = env_float("SCANNER_MAX_EXTENSION_ATR", 1.5)  # do not chase: close vs EMA20
 
 # Hard bounds the 2nd Brain can never leave (max_open_positions can only go DOWN from the env ceiling).
 BIAS_BOUNDS = {
@@ -2287,6 +2299,160 @@ def process_signal(payload: TradingViewPayload) -> None:
 
 
 # ==============================================================================
+# Scanner (autonomous LONG setups: 1h uptrend + 5m EMA20/50 pullback reclaim)
+# ==============================================================================
+class ScannerAgent:
+    """Finds setups on its own and feeds them through the same Research -> Analysis -> Trader pipeline
+    as a webhook signal, so every SOP gate, sizing rule and paper/live switch still applies."""
+
+    def __init__(self, gw: ExchangeGateway, md: MarketData, st: StateStore, dyn: DynamicBias,
+                 research: ResearchAgent) -> None:
+        self.gw, self.md, self.store, self.bias, self.research = gw, md, st, dyn, research
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._seen: dict[str, float] = {}          # symbol -> last evaluated 5m candle open time
+        self._resolved: dict[str, str] = {}
+        self.cycles = 0
+        self.submitted = 0
+        self.last_run: Optional[str] = None
+        self.last_error: Optional[str] = None
+        self.last_candidates: list[dict[str, Any]] = []
+
+    def start(self) -> None:
+        if not SCANNER_ENABLED or (self._thread and self._thread.is_alive()):
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="scanner", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        logger.info("Scanner started (%d symbols, every %.0fs, min score %.0f)", len(SCANNER_SYMBOLS),
+                    SCANNER_INTERVAL_SEC, SCANNER_MIN_SCORE)
+        if self._stop.wait(45.0):
+            return
+        while True:
+            try:
+                if self.gw.ready:
+                    self.cycle()
+            except Exception as exc:
+                self.last_error = redact(exc)
+                logger.error("Scanner cycle failed: %s", redact(exc))
+            if self._stop.wait(SCANNER_INTERVAL_SEC):
+                return
+
+    def _symbol(self, base: str) -> Optional[str]:
+        if base not in self._resolved:
+            try:
+                sym = self.gw.resolve_symbol(base + "USDT")
+                self.gw.check_allowlist(sym)
+                self._resolved[base] = sym
+            except Exception:
+                self._resolved[base] = ""
+        return self._resolved[base] or None
+
+    def evaluate(self, symbol: str) -> Optional[dict[str, Any]]:
+        """Return a candidate dict for a fresh long setup on the last closed 5m candle, else None."""
+        c5 = self.md.candles(symbol, "5m", 120)
+        if len(c5) < 60:
+            return None
+        last_ts = c5[-1][0]
+        if self._seen.get(symbol) == last_ts:
+            return None
+        self._seen[symbol] = last_ts
+        closes = [c[4] for c in c5]
+        a, e20, e50 = atr(c5, ATR_PERIOD), ema(closes, 20), ema(closes, 50)
+        if not a or a <= 0 or e20 is None or e50 is None:
+            return None
+        _, o, h, l, c, _v = c5[-1]
+        prev_high = c5[-2][2]
+        if not (e20 > e50 and c > e20 and c > o and c > prev_high):
+            return None                                         # need uptrend + bullish reclaim of EMA20
+        if c - e20 > SCANNER_MAX_EXTENSION_ATR * a:
+            return None                                         # extended: do not chase
+        touched = min(x[3] for x in c5[-7:-1]) <= e20 + SCANNER_PULLBACK_ATR * a
+        if not touched:
+            return None                                         # no recent pullback to the EMA
+        if trend_bias_1h(self.md.candles(symbol, "1h", 60)) != 1:
+            return None
+        vacc = volume_acceleration(c5)
+        if vacc is None or vacc < self.bias.effective()["min_volume_accel"]:
+            return None
+        swing_low = min(x[3] for x in c5[-SCANNER_SWING_BARS:])
+        sl = min(swing_low - 0.1 * a, c - 0.8 * a)
+        stop_dist = c - sl
+        if stop_dist > SCANNER_MAX_STOP_ATR * a:
+            return None
+        expected_pct = TP1_R_MULT * stop_dist / c * 100.0       # cheap pre-check of the Analysis cost gate
+        if 2.0 * TAKER_FEE_PCT + 2.0 * EST_SLIPPAGE_PCT > MAX_COST_TO_TARGET * expected_pct:
+            return None
+        score = 50.0 + 10.0                                      # base + 1h uptrend
+        score += 15.0 if vacc >= 1.2 else 5.0
+        score += 10.0 if min(x[3] for x in c5[-4:-1]) <= e20 else 0.0
+        score += 5.0 if (c - l) / max(h - l, 1e-12) >= 0.6 else 0.0
+        score += 10.0 if (e20 - e50) / a >= 0.5 else 0.0
+        return {"symbol": symbol, "score": min(score, 100.0), "sl": sl, "candle_ts": last_ts, "atr": a,
+                "vol_accel": round(vacc, 2)}
+
+    def cycle(self) -> dict[str, Any]:
+        self.cycles += 1
+        self.last_run = utc_iso()
+        out: dict[str, Any] = {"scanned": 0, "candidates": 0, "submitted": 0}
+        if BREAKER_HALTS_ENTRIES and self.bias.is_suspended():
+            return {**out, "skipped": "circuit breaker active"}
+        limit = int(min(MAX_OPEN_POSITIONS, self.bias.effective()["max_open_positions"]))
+        active = self.store.active_trades()
+        if limit <= 0 or len(active) >= limit:
+            return {**out, "skipped": f"position slots full ({len(active)}/{limit})"}
+        busy = {t["symbol"] for t in active}
+        cands: list[dict[str, Any]] = []
+        for base in SCANNER_SYMBOLS:
+            sym = self._symbol(base)
+            if not sym or sym in busy:
+                continue
+            last = self.store.last_trade_ts(sym)
+            if SYMBOL_COOLDOWN_SEC > 0 and last and 0 <= time.time() - last < SYMBOL_COOLDOWN_SEC:
+                continue
+            try:
+                cand = self.evaluate(sym)
+            except Exception as exc:
+                logger.debug("Scanner %s skipped: %s", sym, redact(exc))
+                continue
+            out["scanned"] += 1
+            if cand and cand["score"] >= SCANNER_MIN_SCORE:
+                cands.append(cand)
+        cands.sort(key=lambda x: x["score"], reverse=True)
+        self.last_candidates = cands[:5]
+        out["candidates"] = len(cands)
+        for cand in cands[:max(1, SCANNER_MAX_PER_CYCLE)]:
+            try:
+                price = self.gw.ticker(cand["symbol"])["last"]
+                payload = TradingViewPayload(
+                    action="BUY_LONG", symbol=cand["symbol"], price=price, sl=cand["sl"],
+                    signal_id=f"SCAN-{clean_symbol_text(cand['symbol'])}-{int(cand['candle_ts'])}",
+                    timeframe="5m", system="SCANNER", version=APP_VERSION, sop_score=cand["score"])
+            except Exception as exc:
+                logger.warning("Scanner could not build signal for %s: %s", cand["symbol"], redact(exc))
+                continue
+            logger.info("Scanner setup %s score=%.0f sl=%.6g vol_accel=%s", cand["symbol"], cand["score"],
+                        cand["sl"], cand["vol_accel"])
+            process_signal(payload)
+            self.submitted += 1
+            out["submitted"] += 1
+        return out
+
+    def snapshot(self) -> dict[str, Any]:
+        return {"enabled": SCANNER_ENABLED, "symbols": len(SCANNER_SYMBOLS), "cycles": self.cycles,
+                "submitted": self.submitted, "last_run": self.last_run, "last_error": self.last_error,
+                "last_candidates": self.last_candidates}
+
+
+scanner = ScannerAgent(gateway, market_data, store, bias, research_agent)
+
+
+# ==============================================================================
 # FastAPI
 # ==============================================================================
 def validate_config() -> None:
@@ -2331,9 +2497,11 @@ async def lifespan(app: FastAPI):
         logger.error("Startup configuration/exchange initialization failed: %s", redact(exc), exc_info=True)
     monitor.start()
     maintainer.start()
+    scanner.start()
     yield
     monitor.stop()
     maintainer.stop()
+    scanner.stop()
     gateway.ready = False
     logger.info("Bridge shutdown")
 
@@ -2374,7 +2542,7 @@ async def status(x_webhook_secret: Optional[str] = Header(default=None)) -> dict
         snap = dict(STATS)
     return {"service": APP_NAME, "version": APP_VERSION, "mode": "LIVE" if is_live() else "PAPER",
             "exchange_ready": gateway.ready, "stats": snap, "active_trades": len(store.active_trades()),
-            "bias": bias.snapshot(), "brain_last_run": maintainer.last_run, "timestamp": utc_iso()}
+            "bias": bias.snapshot(), "brain_last_run": maintainer.last_run, "scanner": scanner.snapshot(), "timestamp": utc_iso()}
 
 
 @app.get("/analytics")

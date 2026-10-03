@@ -1,0 +1,14 @@
+﻿# secrets
+mexc keys.txt
+*.env
+.env*
+*keys*.txt
+
+# local data / runtime
+*.db
+*.db-journal
+dynamic_bias.json
+__pycache__/
+*.pyc
+.venv/
+venv/
